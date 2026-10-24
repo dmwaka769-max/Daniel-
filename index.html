@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neon Face Scan</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #020806; overflow: hidden;
+    font-family: Consolas, "SFMono-Regular", ui-monospace, monospace; color: #7dffd0; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  video { position: fixed; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+  .hud { position: fixed; left: 18px; top: 14px; font-size: 13px; line-height: 1.7;
+    text-shadow: 0 0 8px #00ffaa; }
+  .hud b { color: #fff; font-weight: 400; }
+  .fps { position: fixed; left: 18px; bottom: 14px; font-size: 17px; color: #e8fff7; }
+  .keys { position: fixed; right: 18px; bottom: 14px; font-size: 11px; opacity: .6; text-align: right; }
+  #start { position: fixed; inset: 0; z-index: 5; background: #020806; display: flex;
+    flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+    text-align: center; padding: 24px; }
+  #start h1 { margin: 0; font-size: clamp(28px, 6vw, 56px); font-weight: 400; letter-spacing: .04em;
+    color: #3dffc0; text-shadow: 0 0 24px #00ff9c; }
+  #start p { margin: 0; max-width: 46ch; line-height: 1.6; opacity: .8; }
+  #go { font: inherit; font-size: 16px; color: #02130c; background: #3dffc0; border: 0;
+    padding: 14px 28px; border-radius: 4px; cursor: pointer; box-shadow: 0 0 28px #00ff9c88; }
+  #go:hover { background: #8dffd9; }
+  #go:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+  #msg { min-height: 1.4em; color: #ffb4a8; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline muted></video>
+
+<div class="hud">scan <b id="st">starting</b><br>fingers <b id="fi">0</b></div>
+<div class="fps">FPS: <span id="fps">0</span></div>
+<div class="keys">espace : dissoudre / reformer &nbsp; F : plein écran</div>
+
+<div id="start">
+  <h1>Neon Face Scan</h1>
+  <p>Ta caméra reste sur ton appareil : rien n'est envoyé ni enregistré. Lève la main devant la caméra pour dissoudre ton visage en particules.</p>
+  <button id="go">Activer la caméra</button>
+  <div id="msg"></div>
+</div>
+
+<script type="module">
+import { FaceLandmarker, HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const FACE_MODEL = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task";
+const HAND_MODEL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
+
+const $ = id => document.getElementById(id);
+const video = $("v"), cv = $("c"), ctx = cv.getContext("2d");
+let W, H;
+function resize() {
+  const r = Math.min(devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight;
+  cv.width = W * r; cv.height = H * r;
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+}
+addEventListener("resize", resize); resize();
+
+let face, hand, sm = [], hands = [], fingers = 0, manual = false;
+let d = 0, lastT = -1, tick = 0, frames = 0, lastFps = performance.now();
+const TESS = FaceLandmarker.FACE_LANDMARKS_TESSELATION;
+const CONT = FaceLandmarker.FACE_LANDMARKS_CONTOURS;
+const HCON = HandLandmarker.HAND_CONNECTIONS;
+const parts = Array.from({ length: 478 }, () => ({
+  a: Math.random() * 6.283, r: 40 + Math.random() * 260, s: 0.5 + Math.random() * 1.5
+}));
+
+async function make(Cls, url, extra) {
+  const fs = make.fs || (make.fs = await FilesetResolver.forVisionTasks(WASM));
+  for (const delegate of ["GPU", "CPU"]) {
+    try {
+      return await Cls.createFromOptions(fs, {
+        baseOptions: { modelAssetPath: url, delegate }, runningMode: "VIDEO", ...extra });
+    } catch (e) { if (delegate === "CPU") throw e; }
+  }
+}
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+function countFingers(h) {
+  let n = 0;
+  for (const [t, p] of [[8, 6], [12, 10], [16, 14], [20, 18]])
+    if (dist(h[0], h[t]) > dist(h[0], h[p]) * 1.1) n++;
+  if (dist(h[4], h[17]) > dist(h[3], h[17]) * 1.15) n++;
+  return n;
+}
+
+function mesh(P, a) {
+  if (a < 0.01) return;
+  ctx.save();
+  ctx.globalAlpha = a; ctx.globalCompositeOperation = "lighter";
+  ctx.strokeStyle = "rgba(0,255,170,.26)"; ctx.lineWidth = 0.8; ctx.beginPath();
+  for (const e of TESS) { const A = P[e.start], B = P[e.end]; ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); }
+  ctx.stroke();
+  ctx.strokeStyle = "#3dffc0"; ctx.lineWidth = 1.8; ctx.shadowColor = "#00ff9c"; ctx.shadowBlur = 14; ctx.beginPath();
+  for (const e of CONT) { const A = P[e.start], B = P[e.end]; ctx.moveTo(A[0], A[1]); ctx.lineTo(B[0], B[1]); }
+  ctx.stroke();
+  ctx.shadowBlur = 0; ctx.fillStyle = "#c4ffee";
+  for (let i = 0; i < P.length; i += 5) ctx.fillRect(P[i][0] - 1, P[i][1] - 1, 2, 2);
+  ctx.restore();
+}
+
+function dust(P, t, sc) {
+  if (d < 0.02) return;
+  ctx.save();
+  ctx.globalCompositeOperation = "lighter"; ctx.globalAlpha = Math.min(1, d * 1.1);
+  ctx.fillStyle = "#4dffb8";
+  for (let i = 0; i < P.length; i++) {
+    const q = parts[i], ang = q.a + t * 0.0003 * q.s;
+    const x = P[i][0] + Math.cos(ang) * q.r * d * sc;
+    const y = P[i][1] + Math.sin(ang) * q.r * d * sc - d * 50 * sc;
+    ctx.fillRect(x, y, 2.2, 2.2);
+  }
+  ctx.restore();
+}
+
+function loop(now) {
+  requestAnimationFrame(loop);
+
+  // Détection (uniquement quand une nouvelle image caméra est disponible)
+  if (video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const L = face.detectForVideo(video, now).faceLandmarks[0];
+    if (L) {
+      if (!sm.length) sm = L.map(p => ({ x: p.x, y: p.y }));
+      else L.forEach((p, i) => { sm[i].x += (p.x - sm[i].x) * 0.55; sm[i].y += (p.y - sm[i].y) * 0.55; });
+    } else sm = [];
+    if ((tick++ & 1) === 0) {
+      hands = hand.detectForVideo(video, now).landmarks;
+      fingers = hands[0] ? countFingers(hands[0]) : 0;
+    }
+  }
+
+  const target = (fingers > 0 || manual) ? 1 : 0;
+  d += (target - d) * 0.07;
+
+  // Fond + caméra (miroir, assombrie)
+  ctx.fillStyle = "#020806"; ctx.fillRect(0, 0, W, H);
+  const wide = W > H * 1.1;
+  const cam = { x: wide ? W / 2 : 0, y: 0, w: wide ? W / 2 : W, h: H };
+  const vw = video.videoWidth || 1280, vh = video.videoHeight || 720;
+  const s = Math.max(cam.w / vw, cam.h / vh);
+  const ox = cam.x + (cam.w - vw * s) / 2, oy = cam.y + (cam.h - vh * s) / 2;
+  const mapC = p => [ox + (1 - p.x) * vw * s, oy + p.y * vh * s];
+
+  ctx.save();
+  ctx.beginPath(); ctx.rect(cam.x, cam.y, cam.w, cam.h); ctx.clip();
+  ctx.globalAlpha = 0.4;
+  ctx.translate(ox + vw * s, oy); ctx.scale(-s, s);
+  ctx.drawImage(video, 0, 0);
+  ctx.restore();
+
+  let status = "searching face";
+  if (sm.length) {
+    const P = sm.map(mapC);
+
+    ctx.save();
+    ctx.beginPath(); ctx.rect(cam.x, cam.y, cam.w, cam.h); ctx.clip();
+    mesh(P, 1 - d);
+    dust(P, now, 1);
+
+    // Ligne de scan
+    if (d < 0.05) {
+      let y0 = 1e9, y1 = -1e9, x0 = 1e9, x1 = -1e9;
+      for (const p of P) { y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); }
+      const y = y0 + ((now % 2200) / 2200) * (y1 - y0);
+      ctx.globalCompositeOperation = "lighter";
+      ctx.strokeStyle = "rgba(120,255,210,.55)"; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(x0 - 20, y); ctx.lineTo(x1 + 20, y); ctx.stroke();
+    }
+
+    // Main
+    if (hands[0]) {
+      const Hp = hands[0].map(mapC);
+      ctx.strokeStyle = "rgba(190,255,235,.7)"; ctx.lineWidth = 1.5; ctx.beginPath();
+      for (const e of HCON) { ctx.moveTo(Hp[e.start][0], Hp[e.start][1]); ctx.lineTo(Hp[e.end][0], Hp[e.end][1]); }
+      ctx.stroke();
+      ctx.fillStyle = "#fff";
+      for (const p of Hp) ctx.fillRect(p[0] - 2, p[1] - 2, 4, 4);
+    }
+    ctx.restore();
+
+    // Hologramme géant (colonne de gauche)
+    if (wide) {
+      let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+      for (const p of P) { x0 = Math.min(x0, p[0]); x1 = Math.max(x1, p[0]); y0 = Math.min(y0, p[1]); y1 = Math.max(y1, p[1]); }
+      const k = Math.min((W / 2) * 0.8 / (x1 - x0), H * 0.75 / (y1 - y0));
+      const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+      const P2 = P.map(p => [W / 4 + (p[0] - cx) * k, H / 2 + (p[1] - cy) * k]);
+      ctx.save();
+      ctx.beginPath(); ctx.rect(0, 0, W / 2, H); ctx.clip();
+      mesh(P2, (1 - d) * 0.9);
+      dust(P2, now, 1.6);
+      ctx.restore();
+    }
+    status = target ? (d > 0.85 ? "dissolved" : "dissolving") : (d > 0.04 ? "reforming" : "locked");
+  }
+
+  $("st").textContent = status;
+  $("fi").textContent = fingers;
+  frames++;
+  if (now - lastFps > 500) { $("fps").textContent = (frames * 1000 / (now - lastFps)).toFixed(1); frames = 0; lastFps = now; }
+}
+
+$("go").onclick = async () => {
+  const msg = $("msg"); $("go").disabled = true;
+  try {
+    msg.style.color = "#7dffd0"; msg.textContent = "Accès à la caméra…";
+    video.srcObject = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" }, audio: false });
+    await video.play();
+    msg.textContent = "Chargement des modèles (internet requis)…";
+    face = await make(FaceLandmarker, FACE_MODEL, { numFaces: 1 });
+    hand = await make(HandLandmarker, HAND_MODEL, { numHands: 1 });
+    $("start").remove();
+    requestAnimationFrame(loop);
+  } catch (e) {
+    msg.style.color = "#ffb4a8";
+    msg.textContent = "Impossible de démarrer : " + (e.message || e) + ". Vérifie l'autorisation caméra et ta connexion.";
+    $("go").disabled = false;
+  }
+};
+
+addEventListener("keydown", e => {
+  if (e.code === "Space") { e.preventDefault(); manual = !manual; }
+  if (e.key === "f" || e.key === "F") {
+    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  }
+});
+</script>
+</body>
+</html>
